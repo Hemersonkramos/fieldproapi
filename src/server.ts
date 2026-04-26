@@ -170,6 +170,7 @@ function autenticar(req: RequestAutenticado, res: Response, next: NextFunction) 
 function autenticarRotasPrivadas(req: RequestAutenticado, res: Response, next: NextFunction) {
   const rotaPublica =
     req.path === "/" ||
+    req.path === "/health/db" ||
     (req.method === "POST" && ["/login", "/login-web"].includes(req.path)) ||
     (req.method === "GET" && req.path === "/equipes");
 
@@ -517,6 +518,16 @@ async function buscarSolicitacaoEscritorioPorId(id: number | string) {
 
 app.get("/", (req, res) => {
   res.send("API FieldPro funcionando");
+});
+
+app.get("/health/db", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true, database: "connected" });
+  } catch (error) {
+    console.error("Erro no healthcheck do banco:", error);
+    res.status(500).json({ ok: false, database: "disconnected" });
+  }
 });
 
 app.post("/login", async (req, res) => {
