@@ -855,6 +855,13 @@ app.post("/rota", async (req, res) => {
 
   try {
     const { id_equipe, latitude, longitude } = req.body;
+    const idEquipe = Number(id_equipe);
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+
+    if (!Number.isFinite(idEquipe) || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ erro: "Dados do ponto de rota invalidos" });
+    }
 
     await connection.beginTransaction();
 
@@ -863,7 +870,7 @@ app.post("/rota", async (req, res) => {
       INSERT INTO pontos_rota (id_equipe, latitude, longitude, data_hora)
       VALUES (?, ?, ?, NOW())
       `,
-      [id_equipe, latitude, longitude]
+      [idEquipe, lat, lng]
     );
 
     await connection.query(
@@ -872,7 +879,7 @@ app.post("/rota", async (req, res) => {
       SET ultima_latitude = ?, ultima_longitude = ?
       WHERE id_equipe = ?
       `,
-      [latitude, longitude, id_equipe]
+      [lat, lng, idEquipe]
     );
 
     await connection.commit();
@@ -881,7 +888,9 @@ app.post("/rota", async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error(error);
-    res.status(500).json({ erro: "Erro ao salvar rota" });
+    res.status(500).json({
+      erro: error instanceof Error ? error.message : "Erro ao salvar rota",
+    });
   } finally {
     connection.release();
   }
@@ -938,6 +947,14 @@ app.post("/pontos-coletados", async (req, res) => {
 
     if (!Array.isArray(fotos) || fotos.length === 0) {
       return res.status(400).json({ erro: "Envie pelo menos uma foto" });
+    }
+
+    const demandaAtual = await buscarSolicitacaoEscritorioPorId(id_solicitacao);
+
+    if (!demandaAtual) {
+      return res.status(404).json({
+        erro: `Solicitacao ${id_solicitacao} nao encontrada. Atualize as demandas antes de sincronizar.`,
+      });
     }
 
     await connection.beginTransaction();
