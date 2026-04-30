@@ -34,12 +34,14 @@ type RequestAutenticado = Request & {
 };
 
 const TOKEN_TTL_SEGUNDOS = 60 * 60 * 12;
+const PRESENCA_EQUIPE_TTL_MS = 2 * 60 * 1000;
 const AUTH_SECRET =
   process.env.AUTH_SECRET || process.env.JWT_SECRET || process.env.DB_PASSWORD || "fieldpro-dev-secret";
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const presencasEquipe = new Map<number, Map<number, number>>();
 
 function base64Url(valor: string | Buffer) {
   return Buffer.from(valor)
@@ -212,6 +214,60 @@ function limitarRequisicoes(req: Request, res: Response, next: NextFunction) {
   }
 
   next();
+}
+
+function limparPresencasExpiradas(agora = Date.now()) {
+  for (const [idEquipe, usuarios] of presencasEquipe.entries()) {
+    for (const [idUsuario, ultimoSinal] of usuarios.entries()) {
+      if (agora - ultimoSinal > PRESENCA_EQUIPE_TTL_MS) {
+        usuarios.delete(idUsuario);
+      }
+    }
+
+    if (usuarios.size === 0) {
+      presencasEquipe.delete(idEquipe);
+    }
+  }
+}
+
+function registrarPresencaEquipe(usuario: UsuarioAutenticado) {
+  if (usuario.perfil !== "equipe" || !usuario.id_equipe) {
+    return;
+  }
+
+  limparPresencasExpiradas();
+
+  const usuarios = presencasEquipe.get(usuario.id_equipe) ?? new Map<number, number>();
+  usuarios.set(usuario.id, Date.now());
+  presencasEquipe.set(usuario.id_equipe, usuarios);
+}
+
+function removerPresencaEquipe(usuario: UsuarioAutenticado) {
+  if (usuario.perfil !== "equipe" || !usuario.id_equipe) {
+    return;
+  }
+
+  const usuarios = presencasEquipe.get(usuario.id_equipe);
+
+  if (!usuarios) {
+    return;
+  }
+
+  usuarios.delete(usuario.id);
+
+  if (usuarios.size === 0) {
+    presencasEquipe.delete(usuario.id_equipe);
+  }
+}
+
+function equipeEstaOnline(idEquipe: number) {
+  limparPresencasExpiradas();
+  return (presencasEquipe.get(idEquipe)?.size ?? 0) > 0;
+}
+
+function totalEquipesOnline() {
+  limparPresencasExpiradas();
+  return Array.from(presencasEquipe.values()).filter((usuarios) => usuarios.size > 0).length;
 }
 
 app.use((_, res, next) => {
@@ -579,6 +635,13 @@ app.post("/login", async (req, res) => {
       id_equipe: usuario.id_equipe ?? null,
     });
 
+    registrarPresencaEquipe({
+      id: usuario.id,
+      user: usuario.user,
+      perfil: usuario.perfil,
+      id_equipe: usuario.id_equipe ?? null,
+    });
+
     res.json({
       mensagem: "Login realizado com sucesso",
       usuario,
@@ -768,6 +831,25 @@ app.get("/equipes", async (req, res) => {
     res.status(500).json({ erro: "Erro ao buscar equipes" });
   }
 });
+
+app.post("/presenca/equipe", (req: RequestAutenticado, res) => {
+  if (!req.usuario || req.usuario.perfil !== "equipe") {
+    return res.status(403).json({ erro: "Acesso permitido apenas para equipes" });
+  }
+
+  registrarPresencaEquipe(req.usuario);
+  res.json({ online: true });
+});
+
+app.delete("/presenca/equipe", (req: RequestAutenticado, res) => {
+  if (!req.usuario || req.usuario.perfil !== "equipe") {
+    return res.status(403).json({ erro: "Acesso permitido apenas para equipes" });
+  }
+
+  removerPresencaEquipe(req.usuario);
+  res.json({ online: false });
+});
+
 app.post("/rota", async (req, res) => {
   const connection = await pool.getConnection();
 
@@ -831,6 +913,7 @@ app.get("/solicitacoes/:id/anexos", async (req, res) => {
 
 app.post("/pontos-coletados", async (req, res) => {
   const connection = await pool.getConnection();
+  const arquivosCriados: string[] = [];
 
   try {
     const {
@@ -892,6 +975,7 @@ app.post("/pontos-coletados", async (req, res) => {
       const buffer = Buffer.from(normalizarBase64(foto.conteudoBase64), "base64");
 
       fs.writeFileSync(caminhoArquivo, buffer);
+      arquivosCriados.push(caminhoArquivo);
 
       await connection.query(
         `
@@ -916,7 +1000,16 @@ app.post("/pontos-coletados", async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error(error);
-    res.status(500).json({ erro: "Erro ao salvar ponto coletado" });
+
+    for (const arquivo of arquivosCriados) {
+      if (fs.existsSync(arquivo)) {
+        fs.unlinkSync(arquivo);
+      }
+    }
+
+    res.status(500).json({
+      erro: error instanceof Error ? error.message : "Erro ao salvar ponto coletado",
+    });
   } finally {
     connection.release();
   }
@@ -1386,7 +1479,12 @@ app.get("/escritorio/equipes", async (req, res) => {
       `
     );
 
-    res.json(rows);
+    res.json(
+      rows.map((equipe: any) => ({
+        ...equipe,
+        online: equipeEstaOnline(Number(equipe.id_equipe)),
+      }))
+    );
   } catch (error) {
     console.error(error);
     res.status(500).json({ erro: "Erro ao buscar equipes" });
@@ -1421,19 +1519,11 @@ app.get("/escritorio/dashboard", async (req, res) => {
       `
     );
 
-    const [equipesOnline]: any = await pool.query(
-      `
-      SELECT COUNT(*) AS total
-      FROM equipes
-      WHERE status = 'Ativo'
-      `
-    );
-
     res.json({
       andamento: andamento[0].total,
       foraPrazo: foraPrazo[0].total,
       emergenciais: emergenciais[0].total,
-      equipesOnline: equipesOnline[0].total,
+      equipesOnline: totalEquipesOnline(),
     });
   } catch (error) {
     console.error(error);
@@ -2283,4 +2373,19 @@ app.get("/escritorio/rota", async (req, res) => {
 app.get("/api/demandas", async (req, res) => {
   const [rows] = await pool.query("SELECT * FROM demandas");
   res.json(rows);
+});
+
+app.use((error: Error & { type?: string; status?: number }, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  if (error.type === "entity.too.large" || error.status === 413) {
+    return res.status(413).json({
+      erro: "Fotos muito grandes para envio. Tente coletar menos fotos neste ponto.",
+    });
+  }
+
+  console.error(error);
+  return res.status(500).json({ erro: "Erro interno do servidor" });
 });
