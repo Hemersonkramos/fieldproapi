@@ -635,13 +635,6 @@ app.post("/login", async (req, res) => {
       id_equipe: usuario.id_equipe ?? null,
     });
 
-    registrarPresencaEquipe({
-      id: usuario.id,
-      user: usuario.user,
-      perfil: usuario.perfil,
-      id_equipe: usuario.id_equipe ?? null,
-    });
-
     res.json({
       mensagem: "Login realizado com sucesso",
       usuario,
