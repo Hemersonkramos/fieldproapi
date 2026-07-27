@@ -2129,11 +2129,7 @@ app.get("/escritorio/producao", async (req, res) => {
         e.numero_equipe AS equipe,
         e.id_equipe,
         e.veiculo,
-        e.placa,
-        CASE
-          WHEN e.status = 'Ativo' THEN 'Online'
-          ELSE 'Offline'
-        END AS status
+        e.placa
       FROM equipes e
       ORDER BY e.numero_equipe ASC
       `
@@ -2277,9 +2273,9 @@ app.get("/escritorio/producao", async (req, res) => {
       equipe: string;
       veiculo: string | null;
       placa: string | null;
-      status: string;
     }>).map((equipe) => {
-      const rotaEquipe = rotasPorEquipe.get(Number(equipe.id_equipe)) || [];
+      const idEquipe = Number(equipe.id_equipe);
+      const rotaEquipe = rotasPorEquipe.get(idEquipe) || [];
       let km = 0;
 
       for (let index = 1; index < rotaEquipe.length; index += 1) {
@@ -2293,9 +2289,10 @@ app.get("/escritorio/producao", async (req, res) => {
 
       return {
         ...equipe,
+        status: equipeEstaOnline(idEquipe) ? "Online" : "Offline",
         km: Number(km.toFixed(2)),
-        pontos: pontosPorEquipe.get(Number(equipe.id_equipe)) || 0,
-        notas: notasPorEquipe.get(Number(equipe.id_equipe)) || 0,
+        pontos: pontosPorEquipe.get(idEquipe) || 0,
+        notas: notasPorEquipe.get(idEquipe) || 0,
       };
     });
 
