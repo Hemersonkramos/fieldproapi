@@ -2272,11 +2272,11 @@ app.get("/escritorio/producao", async (req, res) => {
       notasRows = [];
     }
 
-    const rotasPorEquipe = new Map<number, Array<{ latitude: number; longitude: number }>>();
+    const rotasPorEquipe = new Map<number, Array<{ latitude: number; longitude: number; data_hora: Date | null }>>();
     const pontosPorEquipe = new Map<number, number>();
     const notasPorEquipe = new Map<number, number>();
 
-    (rotasRows as Array<{ id_equipe: number; latitude: number | string; longitude: number | string }>)
+    (rotasRows as Array<{ id_equipe: number; latitude: number | string; longitude: number | string; data_hora: Date | null }>)
       .forEach((row) => {
         const idEquipe = Number(row.id_equipe);
         const latitude = Number(row.latitude);
@@ -2287,7 +2287,7 @@ app.get("/escritorio/producao", async (req, res) => {
         }
 
         const rotaAtual = rotasPorEquipe.get(idEquipe) || [];
-        rotaAtual.push({ latitude, longitude });
+        rotaAtual.push({ latitude, longitude, data_hora: row.data_hora });
         rotasPorEquipe.set(idEquipe, rotaAtual);
       });
 
@@ -2324,6 +2324,8 @@ app.get("/escritorio/producao", async (req, res) => {
         km: Number(km.toFixed(2)),
         pontos: pontosPorEquipe.get(idEquipe) || 0,
         notas: notasPorEquipe.get(idEquipe) || 0,
+        inicio_deslocamento: rotaEquipe[0]?.data_hora ?? null,
+        fim_deslocamento: rotaEquipe[rotaEquipe.length - 1]?.data_hora ?? null,
       };
     });
 
