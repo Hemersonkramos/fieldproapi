@@ -292,6 +292,20 @@ app.use(
 );
 app.use(limitarRequisicoes);
 app.use(express.json({ limit: process.env.JSON_LIMIT || "10mb" }));
+app.get("/uploads/pontos/:nomeArquivo", autenticar, async (req, res, next) => {
+  try {
+    const [fotos]: any = await pool.query(
+      "SELECT conteudo, tipo_arquivo FROM fotos_ponto WHERE caminho_arquivo = ? LIMIT 1",
+      [`/uploads/pontos/${req.params.nomeArquivo}`]
+    );
+    if (!fotos[0]?.conteudo) return next();
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.type(fotos[0].tipo_arquivo || "application/octet-stream");
+    res.send(fotos[0].conteudo);
+  } catch (error) {
+    next(error);
+  }
+});
 app.use("/uploads", autenticar, express.static(uploadsDir));
 app.use(autenticarRotasPrivadas);
 app.use("/admin", exigirPerfis("admin"));
@@ -1021,11 +1035,13 @@ app.post("/pontos-coletados", async (req, res) => {
           id_ponto_coletado,
           nome_arquivo,
           caminho_arquivo,
-          data_foto
+          data_foto,
+          conteudo,
+          tipo_arquivo
         )
-        VALUES (?, ?, ?, NOW())
+        VALUES (?, ?, ?, NOW(), ?, ?)
         `,
-        [idPontoColetado, nomeArquivo, `/uploads/pontos/${nomeArquivo}`]
+        [idPontoColetado, nomeArquivo, `/uploads/pontos/${nomeArquivo}`, buffer, foto.tipo]
       );
     }
 

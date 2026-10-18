@@ -1,4 +1,4 @@
-import mysql from "mysql2/promise";
+import mysql from "mysql2";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -11,7 +11,15 @@ const connection = mysql.createPool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   port: Number(process.env.DB_PORT || 3306),
+  // DATETIME do projeto representa o horario de Brasilia, nao UTC.
+  timezone: "-03:00",
   ssl: usarSsl ? { rejectUnauthorized: true } : undefined,
 });
 
-export default connection;
+connection.on("connection", (session) => {
+  session.query("SET time_zone = '-03:00'", (error) => {
+    if (error) session.destroy();
+  });
+});
+
+export default connection.promise();
