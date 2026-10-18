@@ -858,12 +858,39 @@ app.post("/rota", async (req, res) => {
 
     await connection.beginTransaction();
 
+    // Serializa os registros da equipe para nao criar duas rotas no mesmo dia.
+    const [equipesRota]: any = await connection.query(
+      "SELECT id_equipe FROM equipes WHERE id_equipe = ? FOR UPDATE",
+      [idEquipe]
+    );
+    if (equipesRota.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ erro: "Equipe nao encontrada" });
+    }
+    const [rotasDoDia]: any = await connection.query(
+      "SELECT id FROM rotas_equipe WHERE id_equipe = ? AND data_deslocamento = CURRENT_DATE() ORDER BY id DESC LIMIT 1",
+      [idEquipe]
+    );
+    let idRota = rotasDoDia[0]?.id;
+    if (!idRota) {
+      const [novaRota]: any = await connection.query(
+        "INSERT INTO rotas_equipe (id_equipe, data_deslocamento) VALUES (?, CURRENT_DATE())",
+        [idEquipe]
+      );
+      idRota = novaRota.insertId;
+    }
+
     await connection.query(
       `
-      INSERT INTO pontos_rota (id_equipe, latitude, longitude, data_hora)
+      INSERT INTO pontos_rota (id_rota, latitude, longitude, data_hora)
       VALUES (?, ?, ?, NOW())
       `,
-      [idEquipe, lat, lng]
+      [idRota, lat, lng]
+    );
+
+    await connection.query(
+      "UPDATE rotas_equipe SET quantidade_pontos = COALESCE(quantidade_pontos, 0) + 1 WHERE id = ?",
+      [idRota]
     );
 
     await connection.query(
@@ -2148,10 +2175,11 @@ app.get("/escritorio/producao", async (req, res) => {
     try {
       const [rotasResultado]: any = await pool.query(
         `
-        SELECT pr.id_equipe, pr.latitude, pr.longitude, pr.data_hora
+        SELECT re.id_equipe, pr.latitude, pr.longitude, pr.data_hora
         FROM pontos_rota pr
+        INNER JOIN rotas_equipe re ON re.id = pr.id_rota
         ${whereRota}
-        ORDER BY pr.id_equipe ASC, pr.data_hora ASC
+        ORDER BY re.id_equipe ASC, pr.data_hora ASC, pr.id ASC
         `,
         parametrosRota
       );
@@ -2159,7 +2187,7 @@ app.get("/escritorio/producao", async (req, res) => {
       rotasRows = rotasResultado;
     } catch (error) {
       console.error("Aviso ao carregar rotas da produção:", error);
-      rotasRows = [];
+      throw error;
     }
 
     const filtrosPontos: string[] = [];
@@ -2324,16 +2352,16 @@ app.get("/escritorio/rota", async (req, res) => {
       equipeId = Number(equipesAtivas[0].id_equipe);
     }
 
-    const filtrosRota = ["id_equipe = ?"];
+    const filtrosRota = ["re.id_equipe = ?"];
     const parametrosRota: Array<number | string> = [equipeId];
 
     if (data_inicial) {
-      filtrosRota.push("data_hora >= ?");
+      filtrosRota.push("pr.data_hora >= ?");
       parametrosRota.push(data_inicial);
     }
 
     if (data_final) {
-      filtrosRota.push("data_hora < DATE_ADD(?, INTERVAL 1 DAY)");
+      filtrosRota.push("pr.data_hora < DATE_ADD(?, INTERVAL 1 DAY)");
       parametrosRota.push(data_final);
     }
 
@@ -2342,11 +2370,11 @@ app.get("/escritorio/rota", async (req, res) => {
     try {
       const [rotaRows]: any = await pool.query(
         `
-        SELECT latitude, longitude, data_hora
-        FROM pontos_rota
+        SELECT pr.latitude, pr.longitude, pr.data_hora
+        FROM pontos_rota pr
+        INNER JOIN rotas_equipe re ON re.id = pr.id_rota
         WHERE ${filtrosRota.join(" AND ")}
-        ORDER BY data_hora ASC
-        LIMIT 500
+        ORDER BY pr.data_hora ASC, pr.id ASC
         `,
         parametrosRota
       );
@@ -2354,7 +2382,7 @@ app.get("/escritorio/rota", async (req, res) => {
       rows = rotaRows;
     } catch (error) {
       console.error("Aviso ao carregar rota do escritório:", error);
-      rows = [];
+      throw error;
     }
 
     const rota = rows
