@@ -560,7 +560,8 @@ async function buscarSolicitacaoEscritorioPorId(id: number | string) {
       s.status,
       s.created_at,
       s.data_conclusao,
-      s.data_finalizacao
+      s.data_finalizacao,
+      (SELECT COUNT(*) FROM pontos_coletados pc WHERE pc.id_solicitacao = s.id) AS total_pontos
     FROM solicitacoes s
     LEFT JOIN equipes e ON s.id_equipe = e.id_equipe
     WHERE s.id = ?
@@ -2117,18 +2118,11 @@ app.put("/escritorio/solicitacoes/:id/status", async (req, res) => {
       [status, status, id]
     );
 
-    const [rows]: any = await pool.query(
-      `
-      SELECT * FROM solicitacoes
-      WHERE id = ?
-      LIMIT 1
-      `,
-      [id]
-    );
+    const demandaAtualizada = await buscarSolicitacaoEscritorioPorId(id);
 
     res.json({
       mensagem: "Status atualizado com sucesso",
-      demanda: rows[0],
+      demanda: demandaAtualizada,
     });
   } catch (error) {
     console.error(error);
