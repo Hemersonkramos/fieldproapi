@@ -4,14 +4,23 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import zlib from "zlib";
 import type { NextFunction, Request, Response } from "express";
 import type { ResultSetHeader } from "mysql2";
 import pool from "./database/connection";
+import { garantirIndices } from "./database/indices";
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+
+// Render (e outros hosts) ficam atras de um proxy reverso. Sem isso, req.ip e o
+// IP do proxy e todos os usuarios dividem o mesmo limite de requisicoes.
+const trustProxy = process.env.TRUST_PROXY ?? (process.env.RENDER ? "1" : "");
+if (trustProxy) {
+  app.set("trust proxy", /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
+}
 const uploadsDir = path.resolve(__dirname, "..", "uploads");
 const uploadsPontosDir = path.join(uploadsDir, "pontos");
 const uploadsSolicitacoesDir = path.join(uploadsDir, "solicitacoes");
@@ -194,16 +203,32 @@ function exigirPerfis(...perfis: PerfilUsuario[]) {
 }
 
 const tentativasPorIp = new Map<string, { total: number; resetEm: number }>();
+const JANELA_LIMITE_MS = 15 * 60 * 1000;
+
+// Remove contadores vencidos para o Map nao crescer indefinidamente.
+setInterval(() => {
+  const agora = Date.now();
+  for (const [chave, valor] of tentativasPorIp.entries()) {
+    if (valor.resetEm <= agora) tentativasPorIp.delete(chave);
+  }
+}, JANELA_LIMITE_MS).unref();
 
 function limitarRequisicoes(req: Request, res: Response, next: NextFunction) {
+  // Fotos e anexos sao muitos GETs pequenos ao abrir um levantamento; ja exigem token.
+  if (req.method === "GET" && req.path.startsWith("/uploads/")) {
+    return next();
+  }
+
   const agora = Date.now();
   const ip = req.ip || req.socket.remoteAddress || "desconhecido";
-  const limite = req.path.includes("login") ? 30 : 600;
-  const janelaMs = 15 * 60 * 1000;
-  const atual = tentativasPorIp.get(ip);
+  const ehLogin = req.method === "POST" && ["/login", "/login-web"].includes(req.path);
+  // Login tem contador proprio: antes, o uso normal do sistema consumia o limite do login.
+  const chave = `${ehLogin ? "login" : "geral"}:${ip}`;
+  const limite = ehLogin ? 30 : 1500;
+  const atual = tentativasPorIp.get(chave);
 
   if (!atual || atual.resetEm <= agora) {
-    tentativasPorIp.set(ip, { total: 1, resetEm: agora + janelaMs });
+    tentativasPorIp.set(chave, { total: 1, resetEm: agora + JANELA_LIMITE_MS });
     return next();
   }
 
@@ -292,6 +317,29 @@ app.use(
 );
 app.use(limitarRequisicoes);
 app.use(express.json({ limit: process.env.JSON_LIMIT || "10mb" }));
+
+// Compacta respostas JSON grandes (lista de demandas, producao, pontos) com gzip
+// nativo do Node, sem dependencia extra. Reduz bastante o trafego no celular.
+app.use((req, res, next) => {
+  const aceitaGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] || ""));
+  if (!aceitaGzip) return next();
+
+  const jsonOriginal = res.json.bind(res);
+  res.json = (corpo?: unknown) => {
+    const texto = JSON.stringify(corpo);
+    if (texto === undefined || Buffer.byteLength(texto) < 2048) {
+      return jsonOriginal(corpo);
+    }
+    const compactado = zlib.gzipSync(texto, { level: 6 });
+    res.setHeader("Content-Encoding", "gzip");
+    res.setHeader("Vary", "Accept-Encoding");
+    res.type("application/json");
+    res.send(compactado);
+    return res;
+  };
+  next();
+});
+
 app.get("/uploads/pontos/:nomeArquivo", autenticar, async (req, res, next) => {
   try {
     const [fotos]: any = await pool.query(
@@ -299,7 +347,8 @@ app.get("/uploads/pontos/:nomeArquivo", autenticar, async (req, res, next) => {
       [`/uploads/pontos/${req.params.nomeArquivo}`]
     );
     if (!fotos[0]?.conteudo) return next();
-    res.setHeader("Cache-Control", "private, max-age=3600");
+    // O nome do arquivo e unico e o conteudo nunca muda: o navegador pode guardar por muito tempo.
+    res.setHeader("Cache-Control", "private, max-age=2592000, immutable");
     res.type(fotos[0].tipo_arquivo || "application/octet-stream");
     res.send(fotos[0].conteudo);
   } catch (error) {
@@ -504,6 +553,22 @@ function calcularDistanciaKm(
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
   return raioTerraKm * c;
+}
+
+/**
+ * Horario informado pelo aparelho (coleta feita sem internet). Aceita so datas
+ * validas, de ate 30 dias atras e no maximo 10 minutos no futuro (relogio do
+ * celular adiantado); fora disso usa o horario do servidor.
+ * O Date e gravado pelo mysql2 no fuso da conexao (-03:00, Brasilia).
+ */
+function horarioDoAparelho(valor: unknown) {
+  if (typeof valor !== "string" && typeof valor !== "number") return null;
+  const data = new Date(valor);
+  const agora = Date.now();
+  if (Number.isNaN(data.getTime())) return null;
+  if (data.getTime() > agora + 10 * 60 * 1000) return null;
+  if (data.getTime() < agora - 30 * 24 * 60 * 60 * 1000) return null;
+  return data;
 }
 
 function obterDiretorioSolicitacao(idSolicitacao: number) {
@@ -862,8 +927,10 @@ app.post("/rota", async (req, res) => {
   const connection = await pool.getConnection();
 
   try {
-    const { id_equipe, latitude, longitude } = req.body;
+    const { id_equipe, latitude, longitude, data_hora } = req.body;
     const idEquipe = Number(id_equipe);
+    // Pontos do trajeto guardados offline chegam depois: grava a hora em que foram lidos.
+    const momento = horarioDoAparelho(data_hora) ?? new Date();
     const lat = Number(latitude);
     const lng = Number(longitude);
 
@@ -883,14 +950,14 @@ app.post("/rota", async (req, res) => {
       return res.status(404).json({ erro: "Equipe nao encontrada" });
     }
     const [rotasDoDia]: any = await connection.query(
-      "SELECT id FROM rotas_equipe WHERE id_equipe = ? AND data_deslocamento = CURRENT_DATE() ORDER BY id DESC LIMIT 1",
-      [idEquipe]
+      "SELECT id FROM rotas_equipe WHERE id_equipe = ? AND data_deslocamento = DATE(?) ORDER BY id DESC LIMIT 1",
+      [idEquipe, momento]
     );
     let idRota = rotasDoDia[0]?.id;
     if (!idRota) {
       const [novaRota]: any = await connection.query(
-        "INSERT INTO rotas_equipe (id_equipe, data_deslocamento) VALUES (?, CURRENT_DATE())",
-        [idEquipe]
+        "INSERT INTO rotas_equipe (id_equipe, data_deslocamento) VALUES (?, DATE(?))",
+        [idEquipe, momento]
       );
       idRota = novaRota.insertId;
     }
@@ -898,9 +965,9 @@ app.post("/rota", async (req, res) => {
     await connection.query(
       `
       INSERT INTO pontos_rota (id_rota, latitude, longitude, data_hora)
-      VALUES (?, ?, ?, NOW())
+      VALUES (?, ?, ?, ?)
       `,
-      [idRota, lat, lng]
+      [idRota, lat, lng, momento]
     );
 
     await connection.query(
@@ -967,7 +1034,9 @@ app.post("/pontos-coletados", async (req, res) => {
       longitude,
       observacao,
       fotos,
+      data_coleta,
     } = req.body as {
+      data_coleta?: string;
       id_solicitacao?: number | string;
       ordem_ponto?: number | string;
       latitude?: number | string;
@@ -992,6 +1061,9 @@ app.post("/pontos-coletados", async (req, res) => {
       });
     }
 
+    // Levantamento feito sem internet: usa o horario da coleta, nao o da sincronizacao.
+    const momentoColeta = horarioDoAparelho(data_coleta) ?? new Date();
+
     await connection.beginTransaction();
 
     const [resultadoPonto]: any = await connection.query(
@@ -1004,13 +1076,14 @@ app.post("/pontos-coletados", async (req, res) => {
         data_coleta,
         observacao
       )
-      VALUES (?, ?, ?, ?, NOW(), ?)
+      VALUES (?, ?, ?, ?, ?, ?)
       `,
       [
         Number(id_solicitacao),
         Number(ordem_ponto) || 1,
         String(latitude),
         String(longitude),
+        momentoColeta,
         observacao || null,
       ]
     );
@@ -1023,12 +1096,11 @@ app.post("/pontos-coletados", async (req, res) => {
       const nomeArquivo = `ponto-${idPontoColetado}-${Date.now()}-${Math.round(
         Math.random() * 100000
       )}${extensao}`;
-      const caminhoArquivo = path.join(uploadsPontosDir, nomeArquivo);
       const buffer = Buffer.from(normalizarBase64(foto.conteudoBase64), "base64");
 
-      fs.writeFileSync(caminhoArquivo, buffer);
-      arquivosCriados.push(caminhoArquivo);
-
+      // A foto fica somente no MySQL (coluna conteudo), que e de onde a rota
+      // /uploads/pontos/:nome serve. Gravar tambem em disco duplicava o trabalho e,
+      // no Render, o disco e apagado a cada deploy.
       await connection.query(
         `
         INSERT INTO fotos_ponto (
@@ -1039,9 +1111,9 @@ app.post("/pontos-coletados", async (req, res) => {
           conteudo,
           tipo_arquivo
         )
-        VALUES (?, ?, ?, NOW(), ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         `,
-        [idPontoColetado, nomeArquivo, `/uploads/pontos/${nomeArquivo}`, buffer, foto.tipo]
+        [idPontoColetado, nomeArquivo, `/uploads/pontos/${nomeArquivo}`, momentoColeta, buffer, foto.tipo]
       );
     }
 
@@ -1173,10 +1245,6 @@ app.delete("/pontos-coletados/:id", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
-
 app.get("/solicitacoes/:id/pontos", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1198,23 +1266,36 @@ app.get("/solicitacoes/:id/pontos", async (req, res) => {
       [id]
     );
 
-    for (const ponto of pontos) {
+    // Uma unica consulta para as fotos de todos os pontos (antes era uma por ponto,
+    // o que com o banco no Aiven somava a latencia da rede a cada ponto).
+    const idsPontos = (pontos as Array<{ id: number }>).map((ponto) => ponto.id);
+    const fotosPorPonto = new Map<number, any[]>();
+
+    if (idsPontos.length > 0) {
       const [fotos]: any = await pool.query(
         `
-        SELECT 
+        SELECT
           id,
           id_ponto_coletado,
           nome_arquivo,
           caminho_arquivo,
           data_foto
         FROM fotos_ponto
-        WHERE id_ponto_coletado = ?
-        ORDER BY data_foto DESC
+        WHERE id_ponto_coletado IN (?)
+        ORDER BY data_foto DESC, id DESC
         `,
-        [ponto.id]
+        [idsPontos]
       );
 
-      ponto.fotos = fotos;
+      for (const foto of fotos) {
+        const lista = fotosPorPonto.get(Number(foto.id_ponto_coletado)) ?? [];
+        lista.push(foto);
+        fotosPorPonto.set(Number(foto.id_ponto_coletado), lista);
+      }
+    }
+
+    for (const ponto of pontos) {
+      ponto.fotos = fotosPorPonto.get(Number(ponto.id)) ?? [];
     }
 
     res.json(pontos);
@@ -1276,6 +1357,42 @@ app.post("/login-web", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ erro: "Erro ao realizar login web" });
+  }
+});
+
+// Renova o token de uma sessao ainda valida. O app e o web chamam isso enquanto o
+// usuario esta em uso, para que a sessao so caia por inatividade (controlada no cliente)
+// e nao no meio do trabalho. Reconsulta o banco: usuario excluido ou com perfil
+// alterado nao recebe token novo.
+app.post("/sessao/renovar", async (req: RequestAutenticado, res) => {
+  try {
+    const atual = req.usuario;
+
+    if (!atual) {
+      return res.status(401).json({ erro: "Autenticacao obrigatoria" });
+    }
+
+    const [rows]: any = await pool.query(
+      "SELECT id, user, perfil, id_equipe FROM usuarios WHERE id = ? LIMIT 1",
+      [atual.id]
+    );
+    const usuario = rows[0];
+
+    if (!usuario || usuario.perfil !== atual.perfil) {
+      return res.status(401).json({ erro: "Sessao invalida. Entre novamente." });
+    }
+
+    res.json({
+      token: assinarToken({
+        id: Number(usuario.id),
+        user: String(usuario.user),
+        perfil: usuario.perfil,
+        id_equipe: usuario.id_equipe ?? null,
+      }),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ erro: "Erro ao renovar sessao" });
   }
 });
 
@@ -1547,36 +1664,21 @@ app.get("/escritorio/equipes", async (req, res) => {
 
 app.get("/escritorio/dashboard", async (req, res) => {
   try {
-    const [andamento]: any = await pool.query(
+    // Uma consulta em vez de tres (cada ida ao Aiven custa a latencia da rede).
+    const [totais]: any = await pool.query(
       `
-      SELECT COUNT(*) AS total
+      SELECT
+        COALESCE(SUM(status IN ('Andamento', 'Devolvida')), 0) AS andamento,
+        COALESCE(SUM(prazo < CURDATE() AND status <> 'Finalizada'), 0) AS foraPrazo,
+        COALESCE(SUM(prioridade = 'Emergencial' AND status IN ('Andamento', 'Devolvida')), 0) AS emergenciais
       FROM solicitacoes
-      WHERE status IN ('Andamento', 'Devolvida')
-      `
-    );
-
-    const [foraPrazo]: any = await pool.query(
-      `
-      SELECT COUNT(*) AS total
-      FROM solicitacoes
-      WHERE prazo < CURDATE()
-      AND status <> 'Finalizada'
-      `
-    );
-
-    const [emergenciais]: any = await pool.query(
-      `
-      SELECT COUNT(*) AS total
-      FROM solicitacoes
-      WHERE prioridade = 'Emergencial'
-      AND status IN ('Andamento', 'Devolvida')
       `
     );
 
     res.json({
-      andamento: andamento[0].total,
-      foraPrazo: foraPrazo[0].total,
-      emergenciais: emergenciais[0].total,
+      andamento: Number(totais[0].andamento),
+      foraPrazo: Number(totais[0].foraPrazo),
+      emergenciais: Number(totais[0].emergenciais),
       equipesOnline: totalEquipesOnline(),
     });
   } catch (error) {
@@ -2153,37 +2255,50 @@ app.get("/escritorio/producao", async (req, res) => {
       data_final?: string;
     };
 
-    const [equipesRows]: any = await pool.query(
-      `
-      SELECT
-        e.numero_equipe AS equipe,
-        e.id_equipe,
-        e.veiculo,
-        e.placa
-      FROM equipes e
-      ORDER BY e.numero_equipe ASC
-      `
-    );
-
     const filtrosRota: string[] = [];
     const parametrosRota: string[] = [];
+    const filtrosPontos: string[] = [];
+    const parametrosPontos: string[] = [];
+    const filtrosNotas: string[] = ["s.status IN ('Concluida', 'Finalizada')"];
+    const parametrosNotas: string[] = [];
 
     if (data_inicial) {
       filtrosRota.push("pr.data_hora >= ?");
       parametrosRota.push(data_inicial);
+      filtrosPontos.push("pc.data_coleta >= ?");
+      parametrosPontos.push(data_inicial);
+      filtrosNotas.push("COALESCE(s.data_finalizacao, s.data_conclusao) >= ?");
+      parametrosNotas.push(data_inicial);
     }
 
     if (data_final) {
       filtrosRota.push("pr.data_hora < DATE_ADD(?, INTERVAL 1 DAY)");
       parametrosRota.push(data_final);
+      filtrosPontos.push("pc.data_coleta < DATE_ADD(?, INTERVAL 1 DAY)");
+      parametrosPontos.push(data_final);
+      filtrosNotas.push("COALESCE(s.data_finalizacao, s.data_conclusao) < DATE_ADD(?, INTERVAL 1 DAY)");
+      parametrosNotas.push(data_final);
     }
 
     const whereRota = filtrosRota.length > 0 ? `WHERE ${filtrosRota.join(" AND ")}` : "";
+    const wherePontos =
+      filtrosPontos.length > 0 ? `WHERE ${filtrosPontos.join(" AND ")}` : "";
 
-    let rotasRows: any[] = [];
-
-    try {
-      const [rotasResultado]: any = await pool.query(
+    // As quatro consultas sao independentes: rodam em paralelo no pool, em vez de
+    // esperar uma terminar para comecar a outra.
+    const [equipesResultado, rotasResultado, pontosResultado, notasResultado] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          e.numero_equipe AS equipe,
+          e.id_equipe,
+          e.veiculo,
+          e.placa
+        FROM equipes e
+        ORDER BY e.numero_equipe ASC
+        `
+      ),
+      pool.query(
         `
         SELECT re.id_equipe, pr.latitude, pr.longitude, pr.data_hora
         FROM pontos_rota pr
@@ -2192,85 +2307,46 @@ app.get("/escritorio/producao", async (req, res) => {
         ORDER BY re.id_equipe ASC, pr.data_hora ASC, pr.id ASC
         `,
         parametrosRota
-      );
+      ),
+      pool
+        .query(
+          `
+          SELECT
+            s.id_equipe,
+            COUNT(pc.id) AS total_pontos
+          FROM solicitacoes s
+          LEFT JOIN pontos_coletados pc ON pc.id_solicitacao = s.id
+          ${wherePontos}
+          GROUP BY s.id_equipe
+          `,
+          parametrosPontos
+        )
+        .catch((error) => {
+          console.error("Aviso ao carregar pontos da produção:", error);
+          return [[]] as any;
+        }),
+      pool
+        .query(
+          `
+          SELECT
+            s.id_equipe,
+            COUNT(*) AS total_notas
+          FROM solicitacoes s
+          WHERE ${filtrosNotas.join(" AND ")}
+          GROUP BY s.id_equipe
+          `,
+          parametrosNotas
+        )
+        .catch((error) => {
+          console.error("Aviso ao carregar notas da produção:", error);
+          return [[]] as any;
+        }),
+    ]);
 
-      rotasRows = rotasResultado;
-    } catch (error) {
-      console.error("Aviso ao carregar rotas da produção:", error);
-      throw error;
-    }
-
-    const filtrosPontos: string[] = [];
-    const parametrosPontos: string[] = [];
-
-    if (data_inicial) {
-      filtrosPontos.push("pc.data_coleta >= ?");
-      parametrosPontos.push(data_inicial);
-    }
-
-    if (data_final) {
-      filtrosPontos.push("pc.data_coleta < DATE_ADD(?, INTERVAL 1 DAY)");
-      parametrosPontos.push(data_final);
-    }
-
-    const wherePontos =
-      filtrosPontos.length > 0 ? `WHERE ${filtrosPontos.join(" AND ")}` : "";
-
-    let pontosRows: any[] = [];
-
-    try {
-      const [pontosResultado]: any = await pool.query(
-        `
-        SELECT
-          s.id_equipe,
-          COUNT(pc.id) AS total_pontos
-        FROM solicitacoes s
-        LEFT JOIN pontos_coletados pc ON pc.id_solicitacao = s.id
-        ${wherePontos}
-        GROUP BY s.id_equipe
-        `,
-        parametrosPontos
-      );
-
-      pontosRows = pontosResultado;
-    } catch (error) {
-      console.error("Aviso ao carregar pontos da produção:", error);
-      pontosRows = [];
-    }
-
-    const filtrosNotas: string[] = ["s.status IN ('Concluida', 'Finalizada')"];
-    const parametrosNotas: string[] = [];
-
-    if (data_inicial) {
-      filtrosNotas.push("COALESCE(s.data_finalizacao, s.data_conclusao) >= ?");
-      parametrosNotas.push(data_inicial);
-    }
-
-    if (data_final) {
-      filtrosNotas.push("COALESCE(s.data_finalizacao, s.data_conclusao) < DATE_ADD(?, INTERVAL 1 DAY)");
-      parametrosNotas.push(data_final);
-    }
-
-    let notasRows: any[] = [];
-
-    try {
-      const [notasResultado]: any = await pool.query(
-        `
-        SELECT
-          s.id_equipe,
-          COUNT(*) AS total_notas
-        FROM solicitacoes s
-        WHERE ${filtrosNotas.join(" AND ")}
-        GROUP BY s.id_equipe
-        `,
-        parametrosNotas
-      );
-
-      notasRows = notasResultado;
-    } catch (error) {
-      console.error("Aviso ao carregar notas da produção:", error);
-      notasRows = [];
-    }
+    const equipesRows = equipesResultado[0] as any[];
+    const rotasRows = rotasResultado[0] as any[];
+    const pontosRows = pontosResultado[0] as any[];
+    const notasRows = notasResultado[0] as any[];
 
     const rotasPorEquipe = new Map<number, Array<{ latitude: number; longitude: number; data_hora: Date | null }>>();
     const pontosPorEquipe = new Map<number, number>();
@@ -2435,4 +2511,12 @@ app.use((error: Error & { type?: string; status?: number }, _req: Request, res: 
 
   console.error(error);
   return res.status(500).json({ erro: "Erro interno do servidor" });
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor rodando em http://localhost:${PORT}`);
+
+  if (process.env.DB_AUTO_INDEX !== "false") {
+    void garantirIndices();
+  }
 });
