@@ -831,6 +831,8 @@ app.put("/solicitacoes/:id/status", async (req, res) => {
 app.put("/solicitacoes/:id/concluir", async (req, res) => {
   try {
     const { id } = req.params;
+    // Concluido sem internet: grava o horario em que a equipe concluiu no aparelho.
+    const momentoConclusao = horarioDoAparelho(req.body?.data_conclusao) ?? new Date();
 
     const [atualRows]: any = await pool.query(
       `
@@ -862,10 +864,10 @@ app.put("/solicitacoes/:id/concluir", async (req, res) => {
       `
       UPDATE solicitacoes
       SET status = 'Concluida',
-          data_conclusao = NOW()
+          data_conclusao = ?
       WHERE id = ?
       `,
-      [id]
+      [momentoConclusao, id]
     );
 
     const [rows]: any = await pool.query(
