@@ -1983,7 +1983,8 @@ app.put("/escritorio/solicitacoes/:id", async (req, res) => {
   }
 });
 
-app.delete("/escritorio/solicitacoes/:id", async (req, res) => {
+// Excluir solicitacao e exclusivo do administrador (escritorio so edita).
+app.delete("/escritorio/solicitacoes/:id", exigirPerfis("admin"), async (req, res) => {
   const connection = await pool.getConnection();
 
   try {
